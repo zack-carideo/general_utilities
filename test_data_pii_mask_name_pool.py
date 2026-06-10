@@ -213,5 +213,30 @@ class TestIntegration:
         assert result["name"].iloc[0] == result["name"].iloc[3]
         # email still has @
         assert result["email"].str.contains("@").all()
-        # id column unchanged
-        assert (result["id"] == df["id"]).all()
+        # numeric id column IS masked (values change under tokenize strategy)
+        assert not (result["id"] == df["id"]).all()
+
+    def test_integer_column_names_with_datetime(self):
+        """Regression: _hmac_bytes failed with TypeError when column name was int.
+
+        DataFrame.reset_index() or integer-indexed DataFrames produce integer
+        column names. During fit(), _plan_by_dtype calls _hmac_int(col, "dshift",
+        ...) for datetime columns, which passes the int col name directly to
+        _hmac_bytes where it was concatenated to a str without conversion.
+        """
+        df = pd.DataFrame(
+            {
+                0: ["Alice Wong", "Bob Patel"],
+                1: pd.to_datetime(["2021-04-12", "2019-11-30"]),
+                2: [1250.50, 7800.00],
+            }
+        )
+        m = DataMasker(salt="s", pii_columns={0: "name"})
+        # Must not raise TypeError: can only concatenate str (not "int") to str
+        result = m.fit_transform(df)
+        assert result is not None
+        assert len(result) == 2
+        # datetime column should still produce timestamps (or objects)
+        assert not result[1].isna().any()
+        # numeric column should be masked
+        assert not (result[2] == df[2]).all()

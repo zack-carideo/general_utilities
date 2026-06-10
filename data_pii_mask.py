@@ -188,7 +188,7 @@ class DataMasker:
     # HMAC primitives (deterministic per salt + column)
     # ============================================================
     def _hmac_bytes(self, col_key: str, value) -> bytes:
-        key = (self.salt + "::" + col_key).encode("utf-8")
+        key = (self.salt + "::" + str(col_key)).encode("utf-8")
         msg = repr(value).encode("utf-8")
         return hmac.new(key, msg, hashlib.sha256).digest()
 
@@ -280,6 +280,7 @@ class DataMasker:
     # "tokenize"; "redact" collapses to a constant per type (loses 1:1).
     # ============================================================
     def _mask_pii(self, col: str, value, pii_type: str):
+        col = str(col)
         if value is None or (isinstance(value, float) and pd.isna(value)):
             return value
         s = str(value)

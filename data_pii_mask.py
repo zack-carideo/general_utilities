@@ -60,9 +60,9 @@ PII_INLINE = {
     "url":         re.compile(r"https?://[^\s]+"),
 }
 
-# Small deterministic name pool for `pii_columns={"col": "name"}`.
-# Tiny on purpose — fake names should look plausible without ever mapping
-# back to a real person. The pool size sets a uniqueness ceiling per fit.
+# Legacy name pools — kept for backward compatibility.
+# _fp_name no longer uses these; it uses HMAC-based syllable synthesis instead
+# (_synth_name_word), which scales to any cardinality without a uniqueness ceiling.
 _FAKE_FIRST = [
     "Alex", "Jordan", "Taylor", "Casey", "Morgan", "Riley", "Quinn", "Avery",
     "Drew", "Sage", "Reese", "Rowan", "Hayden", "Parker", "Logan", "Emerson",
@@ -75,6 +75,12 @@ _FAKE_LAST = [
     "Tate", "Marsh", "Lane", "Frost", "Chen", "Patel", "Khan", "Singh",
     "Garcia", "Lopez", "Nguyen", "Kim", "Okafor", "Diaz",
 ]
+
+# Consonant/vowel pools for HMAC-based pronounceable name synthesis.
+# Used by _synth_name_word, which replaces the fixed-pool approach and
+# scales to any dataset cardinality without a uniqueness ceiling.
+_NAME_CONSONANTS = list("bcdfghjklmnprstvwz")  # 18
+_NAME_VOWELS     = list("aeiou")               # 5
 
 
 class DataMasker:
@@ -224,6 +230,35 @@ class DataMasker:
             b = hashlib.sha256(b + bytes([i])).digest()
         return "".join(out)
 
+    @staticmethod
+    def _name_syllables_needed(n_unique: int) -> int:
+        """Return the minimum CV-syllable count so output space >= 10 * n_unique^2.
+
+        This keeps birthday-paradox collision probability negligible for any
+        dataset up to n_unique distinct names.
+        """
+        k = 2
+        # Output space for k pure CV syllables: (18 consonants × 5 vowels)^k = 90^k
+        while 90 ** k < 10 * max(n_unique, 1) ** 2:
+            k += 1
+        return k
+
+    def _synth_name_word(self, col_key: str, s: str, n_syl: int = 2) -> str:
+        """Synthesize a pronounceable name word from HMAC bytes.
+
+        Produces a CV-alternating string of 2*n_syl characters — e.g.
+        n_syl=2 → "Bako", n_syl=3 → "Bakovi", n_syl=4 → "Bakovilu".
+        Because the output is derived directly from the HMAC digest, the
+        effective pool is unlimited: distinct inputs yield distinct outputs
+        with overwhelming probability.
+        """
+        b = self._hmac_bytes(col_key, s)
+        out = []
+        for i in range(n_syl):
+            out.append(_NAME_CONSONANTS[b[2 * i % len(b)] % len(_NAME_CONSONANTS)])
+            out.append(_NAME_VOWELS[b[(2 * i + 1) % len(b)] % len(_NAME_VOWELS)])
+        return "".join(out).capitalize()
+
     # ============================================================
     # PII detection
     # ============================================================
@@ -348,14 +383,18 @@ class DataMasker:
     def _fp_zip_us(self, col, s):
         return self._fp_phone(col, s)
 
-    def _fp_name(self, col, s):
-        # Deterministic fake first + last from small pool
-        first = _FAKE_FIRST[self._hmac_int(col + ":first", s, len(_FAKE_FIRST))]
-        last = _FAKE_LAST[self._hmac_int(col + ":last", s, len(_FAKE_LAST))]
-        # If original looked like single token, return just first
-        if " " not in s.strip():
-            return first
-        return f"{first} {last}"
+    def _fp_name(self, col: str, s: str) -> str:
+        """Fake name via HMAC synthesis; syllable count scales with column cardinality.
+
+        During fit() the column's unique-value count is recorded and used to
+        select a syllable count that keeps the output space >> n_unique^2, so
+        birthday-paradox collisions are negligible regardless of dataset size.
+        """
+        plan = self._plan.get(col, {})
+        n_syl = plan.get("name_n_syllables", 2)
+        first = self._synth_name_word(col + ":first", s, n_syl)
+        last  = self._synth_name_word(col + ":last",  s, n_syl)
+        return first if " " not in s.strip() else f"{first} {last}"
 
     def _fp_address(self, col, s):
         # Synthesize a plausible US-style address deterministically
@@ -436,11 +475,13 @@ class DataMasker:
             return {"kind": "passthrough", "reason": "user_specified"}
 
         if col in self.pii_columns:
-            return {
-                "kind": "pii",
-                "pii_type": self.pii_columns[col],
-                "reason": "user_specified",
-            }
+            pii_type = self.pii_columns[col]
+            plan: dict = {"kind": "pii", "pii_type": pii_type, "reason": "user_specified"}
+            if pii_type == "name":
+                n_unique = int(series.dropna().nunique())
+                plan["name_n_unique"] = n_unique
+                plan["name_n_syllables"] = self._name_syllables_needed(n_unique)
+            return plan
 
         if col in self.force_mask_cols:
             # Even when forced, still attempt PII detection for nicer output
